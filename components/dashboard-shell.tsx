@@ -109,6 +109,8 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
   const lastValidSampleRef = useRef<GeoSample | null>(null);
   const invalidSinceRef = useRef<number | null>(null);
   const invalidReasonRef = useRef<string | null>(null);
+  const invalidTimeoutRef = useRef<number | null>(null);
+  const invalidCountdownIntervalRef = useRef<number | null>(null);
   const cancelRunRef = useRef<(message: string) => Promise<void>>(async () => {});
 
   useEffect(() => {
@@ -124,40 +126,17 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
   }, [isTimerActive]);
 
   useEffect(() => {
-    if (!isRunning) {
-      return;
-    }
-
-    const interval = window.setInterval(() => {
-      if (invalidSinceRef.current === null || invalidReasonRef.current === null) {
-        return;
-      }
-
-      const elapsed = Math.floor((Date.now() - invalidSinceRef.current) / 1000);
-      const remaining = Math.max(0, INVALID_GRACE_PERIOD_SECONDS - elapsed);
-
-      setOverlay({
-        title: "Mouvement invalide detecte",
-        message: `${invalidReasonRef.current} La course sera annulee dans ${remaining} seconde${remaining > 1 ? "s" : ""} si aucun mouvement valide n'est detecte.`,
-        tone: "warning",
-        countdownSeconds: remaining,
-        dismissible: false
-      });
-
-      if (remaining === 0) {
-        void cancelRunRef.current(
-          "Course annulee automatiquement : trop longtemps sans mouvement valide ou avec un signal GPS invalide."
-        );
-      }
-    }, 1000);
-
-    return () => window.clearInterval(interval);
-  }, [isRunning]);
-
-  useEffect(() => {
     return () => {
       if (watchIdRef.current !== null && "geolocation" in navigator) {
         navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+
+      if (invalidTimeoutRef.current !== null) {
+        window.clearTimeout(invalidTimeoutRef.current);
+      }
+
+      if (invalidCountdownIntervalRef.current !== null) {
+        window.clearInterval(invalidCountdownIntervalRef.current);
       }
     };
   }, []);
@@ -185,28 +164,86 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
     invalidSinceRef.current = null;
     invalidReasonRef.current = null;
 
+    if (invalidTimeoutRef.current !== null) {
+      window.clearTimeout(invalidTimeoutRef.current);
+      invalidTimeoutRef.current = null;
+    }
+
+    if (invalidCountdownIntervalRef.current !== null) {
+      window.clearInterval(invalidCountdownIntervalRef.current);
+      invalidCountdownIntervalRef.current = null;
+    }
+
     if (watchIdRef.current !== null && "geolocation" in navigator) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
   }
 
+  function updateInvalidOverlay(remaining: number) {
+    setOverlay({
+      title: "Mouvement invalide detecte",
+      message: `${invalidReasonRef.current} La course sera annulee dans ${remaining} seconde${remaining > 1 ? "s" : ""} si aucun mouvement valide n'est detecte.`,
+      tone: "warning",
+      countdownSeconds: remaining,
+      dismissible: false
+    });
+  }
+
   function beginInvalidWindow(reason: string, status: string) {
     setIsTimerActive(false);
     setGpsStatus(status);
 
+    invalidReasonRef.current = reason;
+
     if (invalidSinceRef.current === null) {
       invalidSinceRef.current = Date.now();
+      updateInvalidOverlay(INVALID_GRACE_PERIOD_SECONDS);
+
+      invalidTimeoutRef.current = window.setTimeout(() => {
+        invalidTimeoutRef.current = null;
+        void cancelRunRef.current(
+          "Course annulee automatiquement : trop longtemps sans mouvement valide ou avec un signal GPS invalide."
+        );
+      }, INVALID_GRACE_PERIOD_SECONDS * 1000);
+
+      invalidCountdownIntervalRef.current = window.setInterval(() => {
+        if (invalidSinceRef.current === null) {
+          return;
+        }
+
+        const elapsed = Math.floor((Date.now() - invalidSinceRef.current) / 1000);
+        const remaining = Math.max(0, INVALID_GRACE_PERIOD_SECONDS - elapsed);
+        updateInvalidOverlay(remaining);
+
+        if (remaining === 0 && invalidCountdownIntervalRef.current !== null) {
+          window.clearInterval(invalidCountdownIntervalRef.current);
+          invalidCountdownIntervalRef.current = null;
+        }
+      }, 1000);
+      return;
     }
 
-    invalidReasonRef.current = reason;
+    const elapsed = Math.floor((Date.now() - invalidSinceRef.current) / 1000);
+    const remaining = Math.max(0, INVALID_GRACE_PERIOD_SECONDS - elapsed);
+    updateInvalidOverlay(remaining);
   }
 
-  function clearInvalidWindow() {
+  function clearInvalidWindow(resumeSample?: GeoSample) {
     const shouldNotifyResume = invalidSinceRef.current !== null || invalidReasonRef.current !== null;
 
     invalidSinceRef.current = null;
     invalidReasonRef.current = null;
+
+    if (invalidTimeoutRef.current !== null) {
+      window.clearTimeout(invalidTimeoutRef.current);
+      invalidTimeoutRef.current = null;
+    }
+
+    if (invalidCountdownIntervalRef.current !== null) {
+      window.clearInterval(invalidCountdownIntervalRef.current);
+      invalidCountdownIntervalRef.current = null;
+    }
 
     setOverlay((current) => {
       if (current?.tone === "warning") {
@@ -215,6 +252,10 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
 
       return current;
     });
+
+    if (resumeSample) {
+      lastValidSampleRef.current = resumeSample;
+    }
 
     if (shouldNotifyResume) {
       setResumeToast({
@@ -326,13 +367,18 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
           return;
         }
 
-        clearInvalidWindow();
+        const wasRecoveringFromInvalidWindow =
+          invalidSinceRef.current !== null || invalidReasonRef.current !== null;
+
+        clearInvalidWindow(nextSample);
         setIsTimerActive(true);
         setGpsStatus(
           `GPS actif • precision ${Math.round(position.coords.accuracy)} m • ${segmentSpeedKmh.toFixed(1)} km/h`
         );
-        setLiveDistanceKm((current) => Number((current + segmentDistanceKm).toFixed(4)));
-        lastValidSampleRef.current = nextSample;
+        if (!wasRecoveringFromInvalidWindow) {
+          setLiveDistanceKm((current) => Number((current + segmentDistanceKm).toFixed(4)));
+          lastValidSampleRef.current = nextSample;
+        }
       },
       (error) => {
         void cancelRun(
