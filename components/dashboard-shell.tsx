@@ -43,11 +43,17 @@ type ToastState = {
   message: string;
 };
 
+type TrackingPhase = "idle" | "arming" | "active" | "paused";
+type SegmentKind = "valid" | "short" | "slow" | "overspeed" | "bad_accuracy";
+
 const GPS_ACCURACY_THRESHOLD_METERS = 20;
 const MIN_VALID_SPEED_KMH = 4;
 const MAX_VALID_SPEED_KMH = 25;
 const MIN_SEGMENT_DISTANCE_METERS = 7;
 const INVALID_GRACE_PERIOD_SECONDS = 60;
+const START_CONFIRMATION_SEGMENTS = 2;
+const INVALID_CONFIRMATION_SEGMENTS = 2;
+const OVERSPEED_CONFIRMATION_SEGMENTS = 2;
 const GPS_WATCH_OPTIONS: PositionOptions = {
   enableHighAccuracy: true,
   maximumAge: 0,
@@ -91,6 +97,10 @@ function haversineDistanceInKm(start: GeoPoint, end: GeoPoint) {
   return 2 * earthRadiusKm * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
 }
 
+function buildInvalidMessage(reason: string, remaining: number) {
+  return `${reason} La course sera annulee dans ${remaining} seconde${remaining > 1 ? "s" : ""} si aucun mouvement valide n'est detecte.`;
+}
+
 export function DashboardShell({ email, profile, onLogout, onSaveRun }: DashboardShellProps) {
   const clan = lilleClans.find((item) => item.id === profile.clan_id);
   const [isRunning, setIsRunning] = useState(false);
@@ -105,12 +115,17 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
   } | null>(null);
   const [overlay, setOverlay] = useState<OverlayState | null>(null);
   const [resumeToast, setResumeToast] = useState<ToastState | null>(null);
+
   const watchIdRef = useRef<number | null>(null);
-  const lastValidSampleRef = useRef<GeoSample | null>(null);
-  const invalidSinceRef = useRef<number | null>(null);
+  const lastSampleRef = useRef<GeoSample | null>(null);
+  const phaseRef = useRef<TrackingPhase>("idle");
   const invalidReasonRef = useRef<string | null>(null);
+  const invalidSinceRef = useRef<number | null>(null);
   const invalidTimeoutRef = useRef<number | null>(null);
   const invalidCountdownIntervalRef = useRef<number | null>(null);
+  const consecutiveValidSegmentsRef = useRef(0);
+  const consecutiveInvalidSegmentsRef = useRef(0);
+  const consecutiveOverspeedSegmentsRef = useRef(0);
   const cancelRunRef = useRef<(message: string) => Promise<void>>(async () => {});
 
   useEffect(() => {
@@ -124,6 +139,18 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
 
     return () => window.clearInterval(interval);
   }, [isTimerActive]);
+
+  useEffect(() => {
+    if (!resumeToast) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setResumeToast(null);
+    }, 3500);
+
+    return () => window.clearTimeout(timeout);
+  }, [resumeToast]);
 
   useEffect(() => {
     return () => {
@@ -141,17 +168,17 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
     };
   }, []);
 
-  useEffect(() => {
-    if (!resumeToast) {
-      return;
+  function clearInvalidTimers() {
+    if (invalidTimeoutRef.current !== null) {
+      window.clearTimeout(invalidTimeoutRef.current);
+      invalidTimeoutRef.current = null;
     }
 
-    const timeout = window.setTimeout(() => {
-      setResumeToast(null);
-    }, 3500);
-
-    return () => window.clearTimeout(timeout);
-  }, [resumeToast]);
+    if (invalidCountdownIntervalRef.current !== null) {
+      window.clearInterval(invalidCountdownIntervalRef.current);
+      invalidCountdownIntervalRef.current = null;
+    }
+  }
 
   function resetTrackingState() {
     setIsRunning(false);
@@ -160,19 +187,16 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
     setLiveDistanceKm(0);
     setGpsStatus("Pret a lancer le suivi GPS.");
     setIsSavingRun(false);
-    lastValidSampleRef.current = null;
-    invalidSinceRef.current = null;
+    setOverlay(null);
+    setResumeToast(null);
+    phaseRef.current = "idle";
+    lastSampleRef.current = null;
     invalidReasonRef.current = null;
-
-    if (invalidTimeoutRef.current !== null) {
-      window.clearTimeout(invalidTimeoutRef.current);
-      invalidTimeoutRef.current = null;
-    }
-
-    if (invalidCountdownIntervalRef.current !== null) {
-      window.clearInterval(invalidCountdownIntervalRef.current);
-      invalidCountdownIntervalRef.current = null;
-    }
+    invalidSinceRef.current = null;
+    consecutiveValidSegmentsRef.current = 0;
+    consecutiveInvalidSegmentsRef.current = 0;
+    consecutiveOverspeedSegmentsRef.current = 0;
+    clearInvalidTimers();
 
     if (watchIdRef.current !== null && "geolocation" in navigator) {
       navigator.geolocation.clearWatch(watchIdRef.current);
@@ -180,89 +204,70 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
     }
   }
 
-  function updateInvalidOverlay(remaining: number) {
-    setOverlay({
-      title: "Mouvement invalide detecte",
-      message: `${invalidReasonRef.current} La course sera annulee dans ${remaining} seconde${remaining > 1 ? "s" : ""} si aucun mouvement valide n'est detecte.`,
-      tone: "warning",
-      countdownSeconds: remaining,
-      dismissible: false
-    });
-  }
+  function clearInvalidWindow() {
+    const hadInvalidWindow = invalidSinceRef.current !== null || invalidReasonRef.current !== null;
 
-  function beginInvalidWindow(reason: string, status: string) {
-    setIsTimerActive(false);
-    setGpsStatus(status);
-
-    invalidReasonRef.current = reason;
-
-    if (invalidSinceRef.current === null) {
-      invalidSinceRef.current = Date.now();
-      updateInvalidOverlay(INVALID_GRACE_PERIOD_SECONDS);
-
-      invalidTimeoutRef.current = window.setTimeout(() => {
-        invalidTimeoutRef.current = null;
-        void cancelRunRef.current(
-          "Course annulee automatiquement : trop longtemps sans mouvement valide ou avec un signal GPS invalide."
-        );
-      }, INVALID_GRACE_PERIOD_SECONDS * 1000);
-
-      invalidCountdownIntervalRef.current = window.setInterval(() => {
-        if (invalidSinceRef.current === null) {
-          return;
-        }
-
-        const elapsed = Math.floor((Date.now() - invalidSinceRef.current) / 1000);
-        const remaining = Math.max(0, INVALID_GRACE_PERIOD_SECONDS - elapsed);
-        updateInvalidOverlay(remaining);
-
-        if (remaining === 0 && invalidCountdownIntervalRef.current !== null) {
-          window.clearInterval(invalidCountdownIntervalRef.current);
-          invalidCountdownIntervalRef.current = null;
-        }
-      }, 1000);
-      return;
-    }
-
-    const elapsed = Math.floor((Date.now() - invalidSinceRef.current) / 1000);
-    const remaining = Math.max(0, INVALID_GRACE_PERIOD_SECONDS - elapsed);
-    updateInvalidOverlay(remaining);
-  }
-
-  function clearInvalidWindow(resumeSample?: GeoSample) {
-    const shouldNotifyResume = invalidSinceRef.current !== null || invalidReasonRef.current !== null;
-
-    invalidSinceRef.current = null;
     invalidReasonRef.current = null;
+    invalidSinceRef.current = null;
+    consecutiveInvalidSegmentsRef.current = 0;
+    clearInvalidTimers();
+    setOverlay((current) => (current?.tone === "warning" ? null : current));
 
-    if (invalidTimeoutRef.current !== null) {
-      window.clearTimeout(invalidTimeoutRef.current);
-      invalidTimeoutRef.current = null;
-    }
-
-    if (invalidCountdownIntervalRef.current !== null) {
-      window.clearInterval(invalidCountdownIntervalRef.current);
-      invalidCountdownIntervalRef.current = null;
-    }
-
-    setOverlay((current) => {
-      if (current?.tone === "warning") {
-        return null;
-      }
-
-      return current;
-    });
-
-    if (resumeSample) {
-      lastValidSampleRef.current = resumeSample;
-    }
-
-    if (shouldNotifyResume) {
+    if (hadInvalidWindow) {
       setResumeToast({
         title: "Signal GPS retrouve",
         message: "Chrono relance"
       });
     }
+  }
+
+  function startInvalidWindow(reason: string, status: string) {
+    invalidReasonRef.current = reason;
+    setIsTimerActive(false);
+    phaseRef.current = "paused";
+    setGpsStatus(status);
+
+    if (invalidSinceRef.current !== null) {
+      return;
+    }
+
+    invalidSinceRef.current = Date.now();
+    setOverlay({
+      title: "Mouvement invalide detecte",
+      message: buildInvalidMessage(reason, INVALID_GRACE_PERIOD_SECONDS),
+      tone: "warning",
+      countdownSeconds: INVALID_GRACE_PERIOD_SECONDS,
+      dismissible: false
+    });
+
+    invalidTimeoutRef.current = window.setTimeout(() => {
+      invalidTimeoutRef.current = null;
+      void cancelRunRef.current(
+        "Course annulee automatiquement : trop longtemps sans mouvement valide ou avec un signal GPS invalide."
+      );
+    }, INVALID_GRACE_PERIOD_SECONDS * 1000);
+
+    invalidCountdownIntervalRef.current = window.setInterval(() => {
+      if (invalidSinceRef.current === null || invalidReasonRef.current === null) {
+        return;
+      }
+
+      const elapsed = Math.floor((Date.now() - invalidSinceRef.current) / 1000);
+      const remaining = Math.max(0, INVALID_GRACE_PERIOD_SECONDS - elapsed);
+
+      setOverlay({
+        title: "Mouvement invalide detecte",
+        message: buildInvalidMessage(invalidReasonRef.current, remaining),
+        tone: "warning",
+        countdownSeconds: remaining,
+        dismissible: false
+      });
+
+      if (remaining === 0 && invalidCountdownIntervalRef.current !== null) {
+        window.clearInterval(invalidCountdownIntervalRef.current);
+        invalidCountdownIntervalRef.current = null;
+      }
+    }, 1000);
   }
 
   async function cancelRun(message: string) {
@@ -281,6 +286,162 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
 
   cancelRunRef.current = cancelRun;
 
+  function classifySegment(sample: GeoSample, previous: GeoSample) {
+    const elapsedBetweenSamplesSeconds = (sample.timestamp - previous.timestamp) / 1000;
+
+    if (sample.accuracy > GPS_ACCURACY_THRESHOLD_METERS) {
+      return {
+        kind: "bad_accuracy" as SegmentKind,
+        distanceKm: 0,
+        distanceMeters: 0,
+        speedKmh: 0
+      };
+    }
+
+    if (elapsedBetweenSamplesSeconds <= 0) {
+      return {
+        kind: "short" as SegmentKind,
+        distanceKm: 0,
+        distanceMeters: 0,
+        speedKmh: 0
+      };
+    }
+
+    const distanceKm = haversineDistanceInKm(previous, sample);
+    const distanceMeters = distanceKm * 1000;
+    const speedKmh = distanceKm / (elapsedBetweenSamplesSeconds / 3600);
+
+    if (distanceMeters <= MIN_SEGMENT_DISTANCE_METERS) {
+      return {
+        kind: "short" as SegmentKind,
+        distanceKm,
+        distanceMeters,
+        speedKmh
+      };
+    }
+
+    if (speedKmh < MIN_VALID_SPEED_KMH) {
+      return {
+        kind: "slow" as SegmentKind,
+        distanceKm,
+        distanceMeters,
+        speedKmh
+      };
+    }
+
+    if (speedKmh > MAX_VALID_SPEED_KMH) {
+      return {
+        kind: "overspeed" as SegmentKind,
+        distanceKm,
+        distanceMeters,
+        speedKmh
+      };
+    }
+
+    return {
+      kind: "valid" as SegmentKind,
+      distanceKm,
+      distanceMeters,
+      speedKmh
+    };
+  }
+
+  function handleValidSegment(sample: GeoSample, speedKmh: number, distanceKm: number) {
+    consecutiveInvalidSegmentsRef.current = 0;
+    consecutiveOverspeedSegmentsRef.current = 0;
+    lastSampleRef.current = sample;
+
+    if (phaseRef.current === "active") {
+      setIsTimerActive(true);
+      setGpsStatus(
+        `GPS actif • precision ${Math.round(sample.accuracy)} m • ${speedKmh.toFixed(1)} km/h`
+      );
+      setLiveDistanceKm((current) => Number((current + distanceKm).toFixed(4)));
+      return;
+    }
+
+    consecutiveValidSegmentsRef.current += 1;
+
+    if (phaseRef.current === "paused") {
+      if (consecutiveValidSegmentsRef.current === 1) {
+        setGpsStatus("Mouvement valide detecte • confirmation en cours...");
+        return;
+      }
+
+      clearInvalidWindow();
+    } else if (phaseRef.current === "arming" && consecutiveValidSegmentsRef.current === 1) {
+      setGpsStatus("Mouvement detecte • confirmation GPS en cours...");
+      return;
+    }
+
+    phaseRef.current = "active";
+    setIsTimerActive(true);
+    setGpsStatus(
+      `GPS actif • precision ${Math.round(sample.accuracy)} m • ${speedKmh.toFixed(1)} km/h`
+    );
+
+    if (phaseRef.current === "active" && consecutiveValidSegmentsRef.current >= START_CONFIRMATION_SEGMENTS) {
+      setLiveDistanceKm((current) => Number((current + distanceKm).toFixed(4)));
+    }
+  }
+
+  function handleInvalidSegment(sample: GeoSample, kind: SegmentKind, speedKmh: number, distanceMeters: number) {
+    lastSampleRef.current = sample;
+    consecutiveValidSegmentsRef.current = 0;
+
+    if (kind === "overspeed") {
+      consecutiveOverspeedSegmentsRef.current += 1;
+      if (consecutiveOverspeedSegmentsRef.current >= OVERSPEED_CONFIRMATION_SEGMENTS) {
+        void cancelRun(
+          `Vitesse anormale detectee (${speedKmh.toFixed(1)} km/h). L'enregistrement est bloque pour eviter la triche en vehicule.`
+        );
+        return;
+      }
+
+      setGpsStatus(`Pic GPS suspect ignore • ${speedKmh.toFixed(1)} km/h`);
+      return;
+    }
+
+    consecutiveOverspeedSegmentsRef.current = 0;
+
+    if (kind === "short" && phaseRef.current === "active") {
+      setGpsStatus(
+        `GPS actif • segment court ignore (${Math.round(distanceMeters)} m) • precision ${Math.round(sample.accuracy)} m`
+      );
+      return;
+    }
+
+    consecutiveInvalidSegmentsRef.current += 1;
+
+    if (consecutiveInvalidSegmentsRef.current < INVALID_CONFIRMATION_SEGMENTS) {
+      setGpsStatus("Verification du mouvement...");
+      return;
+    }
+
+    if (kind === "bad_accuracy") {
+      startInvalidWindow(
+        `Signal GPS trop imprecis (${Math.round(sample.accuracy)} m).`,
+        `Signal GPS faible • precision ${Math.round(sample.accuracy)} m`
+      );
+      return;
+    }
+
+    if (kind === "short") {
+      startInvalidWindow(
+        "Aucun deplacement reel n'a ete detecte.",
+        `Surplace detecte • segment trop court (${Math.round(distanceMeters)} m)`
+      );
+      return;
+    }
+
+    if (kind === "slow") {
+      startInvalidWindow(
+        `Vitesse trop faible (${speedKmh.toFixed(1)} km/h).`,
+        `Chrono en pause • vitesse ${speedKmh.toFixed(1)} km/h`
+      );
+    }
+  }
+
   function handleStartRun() {
     if (!("geolocation" in navigator)) {
       setOverlay({
@@ -292,101 +453,41 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
       return;
     }
 
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-
+    resetTrackingState();
     setRunFeedback(null);
     setOverlay(null);
-    setElapsedSeconds(0);
-    setLiveDistanceKm(0);
     setIsRunning(true);
-    setIsTimerActive(false);
+    phaseRef.current = "arming";
     setGpsStatus("Recherche du signal GPS haute precision...");
-    lastValidSampleRef.current = null;
-    invalidSinceRef.current = null;
-    invalidReasonRef.current = null;
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
-        if (position.coords.accuracy > GPS_ACCURACY_THRESHOLD_METERS) {
-          beginInvalidWindow(
-            `Signal GPS trop imprécis (${Math.round(position.coords.accuracy)} m).`,
-            `Signal GPS faible • precision ${Math.round(position.coords.accuracy)} m`
-          );
-          return;
-        }
-
-        const nextSample: GeoSample = {
+        const sample: GeoSample = {
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
           timestamp: position.timestamp,
           accuracy: position.coords.accuracy
         };
 
-        if (!lastValidSampleRef.current) {
-          lastValidSampleRef.current = nextSample;
-          setGpsStatus(`Premier point GPS valide • precision ${Math.round(position.coords.accuracy)} m`);
-          return;
-        }
-
-        const elapsedBetweenSamplesSeconds =
-          (nextSample.timestamp - lastValidSampleRef.current.timestamp) / 1000;
-
-        if (elapsedBetweenSamplesSeconds <= 0) {
-          return;
-        }
-
-        const segmentDistanceKm = haversineDistanceInKm(lastValidSampleRef.current, nextSample);
-        const segmentDistanceMeters = segmentDistanceKm * 1000;
-        const segmentSpeedKmh = segmentDistanceKm / (elapsedBetweenSamplesSeconds / 3600);
-
-        if (segmentDistanceMeters <= MIN_SEGMENT_DISTANCE_METERS) {
-          lastValidSampleRef.current = nextSample;
-
-          if (invalidSinceRef.current !== null || invalidReasonRef.current !== null) {
-            beginInvalidWindow(
-              "Aucun deplacement reel n'a ete detecte.",
-              `Surplace detecte • segment trop court (${Math.round(segmentDistanceMeters)} m)`
-            );
+        if (!lastSampleRef.current) {
+          if (sample.accuracy > GPS_ACCURACY_THRESHOLD_METERS) {
+            setGpsStatus(`Signal GPS faible • precision ${Math.round(sample.accuracy)} m`);
             return;
           }
 
-          setGpsStatus(
-            `GPS actif • segment court ignore (${Math.round(segmentDistanceMeters)} m) • precision ${Math.round(position.coords.accuracy)} m`
-          );
+          lastSampleRef.current = sample;
+          setGpsStatus(`Premier point GPS valide • precision ${Math.round(sample.accuracy)} m`);
           return;
         }
 
-        if (segmentSpeedKmh < MIN_VALID_SPEED_KMH) {
-          lastValidSampleRef.current = nextSample;
-          beginInvalidWindow(
-            `Vitesse trop faible (${segmentSpeedKmh.toFixed(1)} km/h).`,
-            `Chrono en pause • vitesse ${segmentSpeedKmh.toFixed(1)} km/h`
-          );
+        const segment = classifySegment(sample, lastSampleRef.current);
+
+        if (segment.kind === "valid") {
+          handleValidSegment(sample, segment.speedKmh, segment.distanceKm);
           return;
         }
 
-        if (segmentSpeedKmh > MAX_VALID_SPEED_KMH) {
-          void cancelRun(
-            `Vitesse anormale detectee (${segmentSpeedKmh.toFixed(1)} km/h). L'enregistrement est bloque pour eviter la triche en vehicule.`
-          );
-          return;
-        }
-
-        const wasRecoveringFromInvalidWindow =
-          invalidSinceRef.current !== null || invalidReasonRef.current !== null;
-
-        clearInvalidWindow(nextSample);
-        setIsTimerActive(true);
-        setGpsStatus(
-          `GPS actif • precision ${Math.round(position.coords.accuracy)} m • ${segmentSpeedKmh.toFixed(1)} km/h`
-        );
-        if (!wasRecoveringFromInvalidWindow) {
-          setLiveDistanceKm((current) => Number((current + segmentDistanceKm).toFixed(4)));
-          lastValidSampleRef.current = nextSample;
-        }
+        handleInvalidSegment(sample, segment.kind, segment.speedKmh, segment.distanceMeters);
       },
       (error) => {
         void cancelRun(
@@ -412,6 +513,7 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
     setIsRunning(false);
     setIsTimerActive(false);
     clearInvalidWindow();
+    phaseRef.current = "idle";
     setGpsStatus("Course arretee.");
 
     if (liveDistanceKm <= 0) {
@@ -597,7 +699,7 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
               <p className="mt-3 text-5xl font-semibold tracking-tight">{formatTimer(elapsedSeconds)}</p>
               <p className="mt-3 text-3xl font-semibold tracking-tight">{liveDistanceKm.toFixed(2)} km</p>
               <p className="mt-3 text-sm leading-6 text-paper/72">
-                Le chrono se met en pause si le mouvement est trop lent, trop court ou si le signal GPS est invalide.
+                Le chrono ne demarre qu&apos;apres confirmation du mouvement et se met en pause si le signal ou le rythme deviennent invalides.
               </p>
               <p className="mt-3 text-sm leading-6 text-paper/60">{gpsStatus}</p>
               <p className="mt-2 text-xs uppercase tracking-[0.18em] text-paper/45">
