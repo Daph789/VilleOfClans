@@ -343,7 +343,6 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
         const segmentSpeedKmh = segmentDistanceKm / (elapsedBetweenSamplesSeconds / 3600);
 
         if (segmentDistanceMeters <= MIN_SEGMENT_DISTANCE_METERS) {
-          lastValidSampleRef.current = nextSample;
           beginInvalidWindow(
             "Aucun deplacement reel n'a ete detecte.",
             `Surplace detecte • segment trop court (${Math.round(segmentDistanceMeters)} m)`
@@ -352,7 +351,6 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
         }
 
         if (segmentSpeedKmh < MIN_VALID_SPEED_KMH) {
-          lastValidSampleRef.current = nextSample;
           beginInvalidWindow(
             `Vitesse trop faible (${segmentSpeedKmh.toFixed(1)} km/h).`,
             `Chrono en pause • vitesse ${segmentSpeedKmh.toFixed(1)} km/h`
