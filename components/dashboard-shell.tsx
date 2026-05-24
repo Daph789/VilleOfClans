@@ -343,14 +343,24 @@ export function DashboardShell({ email, profile, onLogout, onSaveRun }: Dashboar
         const segmentSpeedKmh = segmentDistanceKm / (elapsedBetweenSamplesSeconds / 3600);
 
         if (segmentDistanceMeters <= MIN_SEGMENT_DISTANCE_METERS) {
-          beginInvalidWindow(
-            "Aucun deplacement reel n'a ete detecte.",
-            `Surplace detecte • segment trop court (${Math.round(segmentDistanceMeters)} m)`
+          lastValidSampleRef.current = nextSample;
+
+          if (invalidSinceRef.current !== null || invalidReasonRef.current !== null) {
+            beginInvalidWindow(
+              "Aucun deplacement reel n'a ete detecte.",
+              `Surplace detecte • segment trop court (${Math.round(segmentDistanceMeters)} m)`
+            );
+            return;
+          }
+
+          setGpsStatus(
+            `GPS actif • segment court ignore (${Math.round(segmentDistanceMeters)} m) • precision ${Math.round(position.coords.accuracy)} m`
           );
           return;
         }
 
         if (segmentSpeedKmh < MIN_VALID_SPEED_KMH) {
+          lastValidSampleRef.current = nextSample;
           beginInvalidWindow(
             `Vitesse trop faible (${segmentSpeedKmh.toFixed(1)} km/h).`,
             `Chrono en pause • vitesse ${segmentSpeedKmh.toFixed(1)} km/h`
